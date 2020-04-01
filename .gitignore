@@ -1,0 +1,4 @@
+boilcheck-psql
+boilcheck-psql.test
+*.out
+.idea
