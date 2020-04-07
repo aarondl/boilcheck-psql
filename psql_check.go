@@ -508,6 +508,19 @@ func typeCheck(s *State, fn Call, scope *Scope, lhs, rhs pgnodes.Node) error {
 		return nil
 	}
 
+	if p.Number-1 >= len(fn.ArgTypes) {
+		return TypeErr{
+			Schema:     schema,
+			Table:      table,
+			Column:     column,
+			CallType:   "<none>",
+			DriverType: col.Type,
+			DBType:     col.DBType,
+			Parameter:  p.Number,
+			Location:   p.Location,
+			Fn:         fn,
+		}
+	}
 	// argType is something like database/sql.NullBool or int
 	argType := fn.ArgTypes[p.Number-1]
 
