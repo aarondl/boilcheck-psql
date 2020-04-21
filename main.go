@@ -179,6 +179,9 @@ func main() {
 		}
 	}
 
+	if len(errs) != 0 {
+		os.Exit(1)
+	}
 }
 
 func initDriver(driver string) {
