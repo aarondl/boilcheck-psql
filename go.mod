@@ -1,4 +1,4 @@
-module github.com/volatiletech/sqlboiler/cmd/boilcheck-psql
+module github.com/aarondl/boilcheck-psql
 
 go 1.13
 
