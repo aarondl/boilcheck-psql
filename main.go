@@ -8,12 +8,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/volatiletech/sqlboiler/drivers"
-	"github.com/volatiletech/sqlboiler/importers"
-	"golang.org/x/tools/go/packages"
+	"github.com/volatiletech/sqlboiler/v4/drivers"
+	"github.com/volatiletech/sqlboiler/v4/importers"
 
 	"github.com/BurntSushi/toml"
 	"github.com/friendsofgo/errors"
+	"golang.org/x/tools/go/packages"
 )
 
 var (

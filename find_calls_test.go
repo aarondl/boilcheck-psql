@@ -41,7 +41,7 @@ func TestFindTaggedCalls(t *testing.T) {
 		}
 	}
 
-	pkg := `github.com/volatiletech/sqlboiler/cmd/boilcheck-psql/testpackage`
+	pkg := `github.com/volatiletech/sqlboiler/v4/cmd/boilcheck-psql/testpackage`
 	two := `select * from users;` + string(os.PathSeparator)
 	three := `select * from videos;`
 	four := `select * from tags;`

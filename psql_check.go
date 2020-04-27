@@ -5,9 +5,10 @@ import (
 	"path"
 	"strings"
 
+	"github.com/volatiletech/sqlboiler/v4/drivers"
+
 	pgquery "github.com/lfittl/pg_query_go"
 	pgnodes "github.com/lfittl/pg_query_go/nodes"
-	"github.com/volatiletech/sqlboiler/drivers"
 )
 
 // Types of errors
