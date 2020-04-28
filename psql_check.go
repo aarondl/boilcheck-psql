@@ -15,6 +15,8 @@ import (
 const (
 	Unknown = iota
 	Ambiguous
+
+	unknownTypeSentinel = "UNKNOWNTYPESENTINEL"
 )
 
 // IdentErr is an unknown identifier error that occurs when the database
@@ -133,317 +135,383 @@ func checkCalls(state *State, fns []Call) (errs []error) {
 }
 
 func checkCall(state *State, fn Call, tree pgquery.ParsetreeList) (errs []error) {
-	return checkCallRecurse(state, fn, NewScope(state.DBInfo), tree.Statements...)
-}
+	for _, stmt := range tree.Statements {
+		// Quite often things are packed in the raw statement
+		if raw, ok := stmt.(pgnodes.RawStmt); ok {
+			stmt = raw.Stmt
+		}
 
-// checkCallRecurse looks through a parsed sql tree and searches for missing
-// identifiers or type mismatches.
-//
-// The scope map is a set of in-scope table names. If the name is aliased
-// then the key's value is non-zero and represents the real table name.
-func checkCallRecurse(state *State, fn Call, scope *Scope, nodes ...pgnodes.Node) (errs []error) {
-	descend := func(nodes ...pgnodes.Node) []error {
-		return append(errs, checkCallRecurse(state, fn, scope, nodes...)...)
+		// Create a scope for each statement we parse as they should be separate
+		errList := checkCallRecurse(state, fn, NewScope(state.DBInfo), stmt)
+		if len(errList) != 0 {
+			errs = append(errs, errList...)
+		}
 	}
 
-	for _, n := range nodes {
-		switch node := n.(type) {
-		case pgnodes.RawStmt:
-			// Rawstmt seems to be the root of most expressions
-			return checkCallRecurse(state, fn, scope, node.Stmt)
-		case pgnodes.SelectStmt:
-			// If this is an "upper level select" then lets just check the
-			// selects themselves as separate entities.
-			if node.Larg != nil && node.Rarg != nil {
-				errs = descend(*node.Larg, *node.Rarg)
-				continue
+	return errs
+}
+
+// checkCallRecurse looks through a parsed sql node and searches for missing
+// identifiers or type mismatches.
+//
+// The scope is a set of in-scope identifiers.
+func checkCallRecurse(state *State, fn Call, scope *Scope, n pgnodes.Node) (errs []error) {
+	descend := func(node pgnodes.Node) []error {
+		return append(errs, checkCallRecurse(state, fn, scope, node)...)
+	}
+
+	switch node := n.(type) {
+	case pgnodes.RawStmt:
+		// Rawstmt seems to be the root of most expressions
+		panic("there should be no raw statements at this level")
+	case pgnodes.SelectStmt:
+		_, errList := checkSelect(state, fn, scope, node)
+		errs = append(errs, errList...)
+	case pgnodes.UpdateStmt:
+		errs = append(errs, checkUpdate(state, fn, scope, node)...)
+	case pgnodes.InsertStmt:
+		errs = append(errs, checkInsert(state, fn, scope, node)...)
+	case pgnodes.DeleteStmt:
+		errs = append(errs, checkDelete(state, fn, scope, node)...)
+	case pgnodes.SortBy:
+		errs = descend(node.Node)
+	case pgnodes.FuncCall:
+		for _, arg := range node.Args.Items {
+			errs = descend(arg)
+		}
+	case pgnodes.A_Expr:
+		errs = descend(node.Lexpr)
+		errs = descend(node.Rexpr)
+
+		if err := typeCheck(state, fn, scope, node.Lexpr, node.Rexpr); err != nil {
+			errs = append(errs, err)
+		}
+	case pgnodes.BoolExpr:
+		for _, i := range node.Args.Items {
+			errs = descend(i)
+		}
+	case pgnodes.ColumnRef:
+		offset := 0
+
+		var schema, table string
+		if len(node.Fields.Items) == 3 {
+			schema = node.Fields.Items[0].(pgnodes.String).Str
+			table = node.Fields.Items[1].(pgnodes.String).Str
+			offset += 2
+		} else if len(node.Fields.Items) == 2 {
+			table = node.Fields.Items[0].(pgnodes.String).Str
+			offset += 1
+		}
+
+		switch item := node.Fields.Items[offset].(type) {
+		case pgnodes.String:
+			column := item.Str
+			var kind int
+			ret := scope.has(schema, table, column)
+			switch ret {
+			case scopeRetUnknown:
+				kind = Unknown
+			case scopeRetAmbiguous:
+				kind = Ambiguous
 			}
 
-			// Bring all the tables into scope
-			nTables := 0
-
-			addTable := func(r pgnodes.RangeVar) {
-				table := *r.Relname
-				var alias, schema string
-				if r.Schemaname != nil {
-					schema = *r.Schemaname
-				}
-				if r.Alias != nil {
-					alias = *r.Alias.Aliasname
-				}
-
-				if !scope.pushTable(schema, table, alias) {
-					errs = append(errs, IdentErr{
-						Schema:   schema,
-						Table:    table,
-						Location: r.Location,
-						Fn:       fn,
-					})
-				} else {
-					nTables++
-				}
-			}
-
-			// The joins are recursive in nature, but we're going to
-			// process it iteratively since we're still in the middle
-			// of processing a select statement
-			stack := make([]pgnodes.Node, len(node.FromClause.Items))
-			copy(stack, node.FromClause.Items)
-
-			for len(stack) > 0 {
-				popped := stack[len(stack)-1]
-				stack = stack[:len(stack)-1]
-
-				switch item := popped.(type) {
-				case pgnodes.RangeVar:
-					addTable(item)
-				case pgnodes.JoinExpr:
-					stack = append(stack, item.Quals)
-					stack = append(stack, item.Rarg)
-					stack = append(stack, item.Larg)
-				case pgnodes.A_Expr:
-					errs = descend(popped)
-				case pgnodes.BoolExpr:
-					errs = descend(popped)
-				default:
-					panic(fmt.Sprintf("what is this weird from statement: %T", item))
-				}
-			}
-
-			// Follow-up clauses
-			errs = descend(node.WhereClause)
-			errs = descend(node.HavingClause)
-
-			// Process select list after where/having, but before GroupBy and
-			// OrderBy so that we can create a list of output_name's that
-			// can be referenced by those two clauses.
-			//
-			// Processing in this way also stops the ResTarget case from
-			// seeing these aliases and attempting to resolve them as real names
-			// as in the update clause case.
-			var addRefs []outputColRef
-			for _, listItem := range node.TargetList.Items {
-				resTarg := listItem.(pgnodes.ResTarget)
-
-				// If there's no name we need to do no fancy scoping pieces
-				if resTarg.Name == nil {
-					errs = descend(resTarg.Val)
-					continue
-				}
-
-				var column *drivers.Column
-				colRef, ok := resTarg.Val.(pgnodes.ColumnRef)
-				if ok {
-					var schema, table, col string
-					ln := len(colRef.Fields.Items)
-					col = colRef.Fields.Items[ln-1].(pgnodes.String).Str
-					if ln >= 2 {
-						table = colRef.Fields.Items[ln-2].(pgnodes.String).Str
-					}
-					if ln >= 3 {
-						schema = colRef.Fields.Items[ln-3].(pgnodes.String).Str
-					}
-
-					var ret int
-					column, ret = scope.get(schema, table, col)
-					if ret != scopeRetOk {
-						errs = append(errs, IdentErr{
-							Schema:   schema,
-							Table:    table,
-							Column:   col,
-							Location: colRef.Location,
-							Fn:       fn,
-						})
-					}
-				}
-
-				addRefs = append(addRefs, outputColRef{
-					name: *resTarg.Name, col: column,
-				})
-			}
-
-			for _, r := range addRefs {
-				scope.pushOutputName(r.name, r.col)
-			}
-
-			for _, items := range node.GroupClause.Items {
-				errs = descend(items)
-			}
-			for _, items := range node.SortClause.Items {
-				errs = descend(items)
-			}
-
-			for range addRefs {
-				scope.popOutputName()
-			}
-
-			for i := 0; i < nTables; i++ {
-				scope.popTable()
-			}
-		case pgnodes.UpdateStmt:
-			var schema, alias string
-			if node.Relation.Schemaname != nil {
-				schema = *node.Relation.Schemaname
-			}
-			if node.Relation.Alias != nil {
-				alias = *node.Relation.Alias.Aliasname
-			}
-			table := *node.Relation.Relname
-
-			nTables := 0
-			if !scope.pushTable(schema, table, alias) {
+			if ret != scopeRetOk {
 				errs = append(errs, IdentErr{
+					Kind:     kind,
 					Schema:   schema,
 					Table:    table,
-					Location: node.Relation.Location,
+					Column:   column,
+					Location: node.Location,
 					Fn:       fn,
 				})
-			} else {
-				nTables++
 			}
-
-			for _, c := range node.TargetList.Items {
-				errs = descend(c)
-			}
-			errs = descend(node.WhereClause)
-
-			for i := 0; i < nTables; i++ {
-				scope.popTable()
-			}
-		case pgnodes.InsertStmt:
-			var schema, alias string
-			if node.Relation.Schemaname != nil {
-				schema = *node.Relation.Schemaname
-			}
-			if node.Relation.Alias != nil {
-				alias = *node.Relation.Alias.Aliasname
-			}
-			table := *node.Relation.Relname
-
-			nTables := 0
-			if !scope.pushTable(schema, table, alias) {
+		case pgnodes.A_Star:
+			break
+		default:
+			panic(fmt.Sprintf("%T", node.Fields.Items[1]))
+		}
+	case pgnodes.SubLink:
+		errs = descend(node.Subselect)
+	case pgnodes.ResTarget:
+		// ResTarget can also happen in Select lists, but we circumvent
+		// that in the select case
+		if node.Name != nil {
+			col := *node.Name
+			// Ambiguous can't happen because there's only one table allowed
+			// in an update statement.
+			if scope.has("", "", col) == scopeRetUnknown {
 				errs = append(errs, IdentErr{
-					Schema:   schema,
-					Table:    table,
-					Location: node.Relation.Location,
+					Column:   col,
+					Location: node.Location,
 					Fn:       fn,
 				})
-			} else {
-				nTables++
-			}
-
-			for _, c := range node.Cols.Items {
-				errs = descend(c)
-			}
-
-			for i := 0; i < nTables; i++ {
-				scope.popTable()
-			}
-		case pgnodes.DeleteStmt:
-			var schema, alias string
-			if node.Relation.Schemaname != nil {
-				schema = *node.Relation.Schemaname
-			}
-			if node.Relation.Alias != nil {
-				alias = *node.Relation.Alias.Aliasname
-			}
-			table := *node.Relation.Relname
-
-			nTables := 0
-			if !scope.pushTable(schema, table, alias) {
-				errs = append(errs, IdentErr{
-					Schema:   schema,
-					Table:    table,
-					Location: node.Relation.Location,
-					Fn:       fn,
-				})
-			} else {
-				nTables++
-			}
-
-			errs = descend(node.WhereClause)
-
-			for i := 0; i < nTables; i++ {
-				scope.popTable()
-			}
-		case pgnodes.SortBy:
-			errs = descend(node.Node)
-		case pgnodes.FuncCall:
-			for _, arg := range node.Args.Items {
-				errs = descend(arg)
-			}
-		case pgnodes.A_Expr:
-			errs = descend(node.Lexpr)
-			errs = descend(node.Rexpr)
-
-			if err := typeCheck(state, fn, scope, node.Lexpr, node.Rexpr); err != nil {
-				errs = append(errs, err)
-			}
-		case pgnodes.BoolExpr:
-			for _, i := range node.Args.Items {
-				errs = descend(i)
-			}
-		case pgnodes.ColumnRef:
-			offset := 0
-
-			var schema, table string
-			if len(node.Fields.Items) == 3 {
-				schema = node.Fields.Items[0].(pgnodes.String).Str
-				table = node.Fields.Items[1].(pgnodes.String).Str
-				offset += 2
-			} else if len(node.Fields.Items) == 2 {
-				table = node.Fields.Items[0].(pgnodes.String).Str
-				offset += 1
-			}
-
-			switch item := node.Fields.Items[offset].(type) {
-			case pgnodes.String:
-				column := item.Str
-				var kind int
-				ret := scope.has(schema, table, column)
-				switch ret {
-				case scopeRetUnknown:
-					kind = Unknown
-				case scopeRetAmbiguous:
-					kind = Ambiguous
-				}
-
-				if ret != scopeRetOk {
-					errs = append(errs, IdentErr{
-						Kind:     kind,
-						Schema:   schema,
-						Table:    table,
-						Column:   column,
-						Location: node.Location,
-						Fn:       fn,
-					})
-				}
-			case pgnodes.A_Star:
-				break
-			default:
-				panic(fmt.Sprintf("%T", node.Fields.Items[1]))
-			}
-		case pgnodes.SubLink:
-			errs = descend(node.Subselect)
-		case pgnodes.ResTarget:
-			// ResTarget can also happen in Select lists, but we circumvent
-			// that in the select case
-			if node.Name != nil {
-				col := *node.Name
-				// Ambiguous can't happen because there's only one table allowed
-				// in an update statement.
-				if scope.has("", "", col) == scopeRetUnknown {
-					errs = append(errs, IdentErr{
-						Column:   col,
-						Location: node.Location,
-						Fn:       fn,
-					})
-				}
-			}
-			if node.Val != nil {
-				errs = descend(node.Val)
 			}
 		}
+		if node.Val != nil {
+			errs = descend(node.Val)
+		}
+	}
+
+	return errs
+}
+
+func checkSelect(state *State, fn Call, scope *Scope, sel pgnodes.SelectStmt) (selectMap interface{}, errs []error) {
+	descend := func(node pgnodes.Node) []error {
+		return append(errs, checkCallRecurse(state, fn, scope, node)...)
+	}
+
+	// If this is an "upper level select" then lets just check the
+	// selects themselves as separate entities.
+	if sel.Larg != nil && sel.Rarg != nil {
+		errs = descend(*sel.Larg)
+		errs = descend(*sel.Rarg)
+		return nil, errs
+	}
+
+	// Bring all the tables into scope
+	nTables := 0
+
+	addTable := func(r pgnodes.RangeVar) {
+		table := *r.Relname
+		var alias, schema string
+		if r.Schemaname != nil {
+			schema = *r.Schemaname
+		}
+		if r.Alias != nil {
+			alias = *r.Alias.Aliasname
+		}
+
+		if !scope.pushTable(schema, table, alias) {
+			errs = append(errs, IdentErr{
+				Schema:   schema,
+				Table:    table,
+				Location: r.Location,
+				Fn:       fn,
+			})
+		} else {
+			nTables++
+		}
+	}
+
+	// The joins are recursive in nature, but we're going to
+	// process it iteratively since we're still in the middle
+	// of processing a select statement
+	stack := make([]pgnodes.Node, len(sel.FromClause.Items))
+	copy(stack, sel.FromClause.Items)
+
+	for len(stack) > 0 {
+		popped := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		switch item := popped.(type) {
+		case pgnodes.RangeVar:
+			addTable(item)
+		case pgnodes.JoinExpr:
+			stack = append(stack, item.Quals)
+			stack = append(stack, item.Rarg)
+			stack = append(stack, item.Larg)
+		case pgnodes.A_Expr:
+			errs = descend(popped)
+		case pgnodes.BoolExpr:
+			errs = descend(popped)
+		case pgnodes.RangeSubselect:
+			if item.Alias == nil {
+				panic(fmt.Sprintf("subquery: %s\nmust have alias", item.Subquery.Deparse()))
+			}
+
+			var subSelectScope *Scope
+			if item.Lateral {
+				// Lateral things have access to the outside world
+				// but we don't want to poison our current scope with
+				// its internal nonsense so clone it
+				subSelectScope = scope.clone()
+			} else {
+				subSelectScope = NewScope(scope.info)
+			}
+
+			subSelect, ok := item.Subquery.(pgnodes.SelectStmt)
+			if !ok {
+				panic(fmt.Sprintf("subquery: %s\nnot a select statement", item.Subquery.Deparse()))
+			}
+
+			subSelMap, subSelectErrs := checkSelect(state, fn, subSelectScope, subSelect)
+			if len(subSelectErrs) > 0 {
+				errs = append(errs, subSelectErrs...)
+			}
+
+			_ = subSelMap
+		default:
+			panic(fmt.Sprintf("what is this weird from statement: %T", item))
+		}
+	}
+
+	// Follow-up clauses
+	errs = descend(sel.WhereClause)
+	errs = descend(sel.HavingClause)
+
+	// Process select list after where/having, but before GroupBy and
+	// OrderBy so that we can create a list of output_name's that
+	// can be referenced by those two clauses.
+	//
+	// Processing in this way also stops the ResTarget case from
+	// seeing these aliases and attempting to resolve them as real names
+	// as in the update clause case.
+	var addRefs []outputColRef
+	for _, listItem := range sel.TargetList.Items {
+		resTarg := listItem.(pgnodes.ResTarget)
+
+		// If there's no name we need to do no fancy scoping pieces
+		if resTarg.Name == nil {
+			errs = descend(resTarg.Val)
+			continue
+		}
+
+		var column *drivers.Column
+		colRef, ok := resTarg.Val.(pgnodes.ColumnRef)
+		if ok {
+			var schema, table, col string
+			ln := len(colRef.Fields.Items)
+			col = colRef.Fields.Items[ln-1].(pgnodes.String).Str
+			if ln >= 2 {
+				table = colRef.Fields.Items[ln-2].(pgnodes.String).Str
+			}
+			if ln >= 3 {
+				schema = colRef.Fields.Items[ln-3].(pgnodes.String).Str
+			}
+
+			var ret int
+			column, ret = scope.get(schema, table, col)
+			if ret != scopeRetOk {
+				errs = append(errs, IdentErr{
+					Schema:   schema,
+					Table:    table,
+					Column:   col,
+					Location: colRef.Location,
+					Fn:       fn,
+				})
+			}
+		}
+
+		addRefs = append(addRefs, outputColRef{
+			name: *resTarg.Name, col: column,
+		})
+	}
+
+	for _, r := range addRefs {
+		scope.pushOutputName(r.name, r.col)
+	}
+
+	for _, items := range sel.GroupClause.Items {
+		errs = descend(items)
+	}
+	for _, items := range sel.SortClause.Items {
+		errs = descend(items)
+	}
+
+	for range addRefs {
+		scope.popOutputName()
+	}
+
+	for i := 0; i < nTables; i++ {
+		scope.popTable()
+	}
+
+	return nil, errs
+}
+
+func checkUpdate(state *State, fn Call, scope *Scope, update pgnodes.UpdateStmt) (errs []error) {
+	var schema, alias string
+	if update.Relation.Schemaname != nil {
+		schema = *update.Relation.Schemaname
+	}
+	if update.Relation.Alias != nil {
+		alias = *update.Relation.Alias.Aliasname
+	}
+	table := *update.Relation.Relname
+
+	nTables := 0
+	if !scope.pushTable(schema, table, alias) {
+		errs = append(errs, IdentErr{
+			Schema:   schema,
+			Table:    table,
+			Location: update.Relation.Location,
+			Fn:       fn,
+		})
+	} else {
+		nTables++
+	}
+
+	for _, c := range update.TargetList.Items {
+		errs = append(errs, checkCallRecurse(state, fn, scope, c)...)
+	}
+	errs = append(errs, checkCallRecurse(state, fn, scope, update.WhereClause)...)
+
+	for i := 0; i < nTables; i++ {
+		scope.popTable()
+	}
+
+	return errs
+}
+
+func checkInsert(state *State, fn Call, scope *Scope, ins pgnodes.InsertStmt) (errs []error) {
+	var schema, alias string
+	if ins.Relation.Schemaname != nil {
+		schema = *ins.Relation.Schemaname
+	}
+	if ins.Relation.Alias != nil {
+		alias = *ins.Relation.Alias.Aliasname
+	}
+	table := *ins.Relation.Relname
+
+	nTables := 0
+	if !scope.pushTable(schema, table, alias) {
+		errs = append(errs, IdentErr{
+			Schema:   schema,
+			Table:    table,
+			Location: ins.Relation.Location,
+			Fn:       fn,
+		})
+	} else {
+		nTables++
+	}
+
+	for _, c := range ins.Cols.Items {
+		errs = append(errs, checkCallRecurse(state, fn, scope, c)...)
+	}
+
+	for i := 0; i < nTables; i++ {
+		scope.popTable()
+	}
+
+	return errs
+}
+
+func checkDelete(state *State, fn Call, scope *Scope, del pgnodes.DeleteStmt) (errs []error) {
+	var schema, alias string
+	if del.Relation.Schemaname != nil {
+		schema = *del.Relation.Schemaname
+	}
+	if del.Relation.Alias != nil {
+		alias = *del.Relation.Alias.Aliasname
+	}
+	table := *del.Relation.Relname
+
+	nTables := 0
+	if !scope.pushTable(schema, table, alias) {
+		errs = append(errs, IdentErr{
+			Schema:   schema,
+			Table:    table,
+			Location: del.Relation.Location,
+			Fn:       fn,
+		})
+	} else {
+		nTables++
+	}
+
+	errs = append(errs, checkCallRecurse(state, fn, scope, del.WhereClause)...)
+
+	for i := 0; i < nTables; i++ {
+		scope.popTable()
 	}
 
 	return errs
@@ -594,6 +662,20 @@ func NewScope(info *drivers.DBInfo) *Scope {
 	}
 }
 
+// clone the object so it can continue to be used without affecting the parent
+// scope
+func (s *Scope) clone() *Scope {
+	cloned := new(Scope)
+	cloned.info = s.info
+	cloned.tables = make([]*drivers.Table, len(s.tables))
+	cloned.aliases = make([]string, len(s.aliases))
+	cloned.outputNames = make([]outputColRef, len(s.outputNames))
+	copy(cloned.tables, s.tables)
+	copy(cloned.aliases, s.aliases)
+	copy(cloned.outputNames, s.outputNames)
+	return cloned
+}
+
 // pushTable adds the table to the current scope. If it fails that means
 // the database info did not contain that table.
 func (s *Scope) pushTable(schema, table, alias string) bool {
@@ -613,6 +695,14 @@ func (s *Scope) pushTable(schema, table, alias string) bool {
 	}
 
 	return false
+}
+
+// pushPseudoTable is used for when we need to create a new table
+// out of thin air. Useful for subqueries etc.
+func (s *Scope) pushPseudoTable(schema, table, alias string, data *drivers.Table) {
+	debugf("PUSH(P): s(%s) t(%s) a(%s)\n", schema, table, alias)
+	s.aliases = append(s.aliases, alias)
+	s.tables = append(s.tables, data)
 }
 
 func (s *Scope) popTable() {

@@ -4,8 +4,8 @@ import (
 	"go/token"
 	"testing"
 
-	"github.com/volatiletech/sqlboiler/drivers"
-	"github.com/volatiletech/sqlboiler/importers"
+	"github.com/volatiletech/sqlboiler/v4/drivers"
+	"github.com/volatiletech/sqlboiler/v4/importers"
 )
 
 func TestUnknownIdentifiers(t *testing.T) {
@@ -221,6 +221,28 @@ func TestUnknownIdentifiers(t *testing.T) {
 			from users
 			left join videos on videos.user_id = users.id
 			left join comments on comments.video_id = videos.id
+			`)
+			errs := checkCallWrapper(call)
+			checkErrs(t, errs,
+				IdentErr{Table: "users", Location: 21},
+				IdentErr{Table: "videos", Location: 40},
+				IdentErr{Table: "videos", Column: "user_id", Location: 50},
+				IdentErr{Table: "users", Column: "id", Location: 67},
+				IdentErr{Table: "comments", Location: 89},
+				IdentErr{Table: "comments", Column: "video_id", Location: 101},
+				IdentErr{Table: "videos", Column: "id", Location: 121},
+			)
+		})
+		t.Run("LateralJoin", func(t *testing.T) {
+			t.Parallel()
+
+			call := testCall(`
+			select users.id
+			from users
+			left join lateral (
+				select videos.id, videos.user_id
+				from videos
+			) as v on v.user_id = users.id
 			`)
 			errs := checkCallWrapper(call)
 			checkErrs(t, errs,
