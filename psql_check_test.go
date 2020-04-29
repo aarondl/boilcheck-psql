@@ -1,12 +1,21 @@
 package main
 
 import (
+	"flag"
 	"go/token"
+	"os"
 	"testing"
 
 	"github.com/volatiletech/sqlboiler/v4/drivers"
 	"github.com/volatiletech/sqlboiler/v4/importers"
 )
+
+func TestMain(m *testing.M) {
+	flag.Parse()
+	flagDebug = testing.Verbose()
+	code := m.Run()
+	os.Exit(code)
+}
 
 func TestUnknownIdentifiers(t *testing.T) {
 	t.Parallel()
@@ -244,15 +253,22 @@ func TestUnknownIdentifiers(t *testing.T) {
 				from videos
 			) as v on v.user_id = users.id
 			`)
-			errs := checkCallWrapper(call)
+			state := &State{DBInfo: &drivers.DBInfo{
+				Tables: []drivers.Table{
+					{
+						Name: "videos",
+						Columns: []drivers.Column{
+							{Name: "id"},
+							{Name: "user_id"},
+						},
+					},
+				},
+			}}
+			errs := checkCallWithState(state, call)
 			checkErrs(t, errs,
-				IdentErr{Table: "users", Location: 21},
-				IdentErr{Table: "videos", Location: 40},
-				IdentErr{Table: "videos", Column: "user_id", Location: 50},
-				IdentErr{Table: "users", Column: "id", Location: 67},
-				IdentErr{Table: "comments", Location: 89},
-				IdentErr{Table: "comments", Column: "video_id", Location: 101},
-				IdentErr{Table: "videos", Column: "id", Location: 121},
+				IdentErr{Table: "users", Location: 28},
+				IdentErr{Table: "users", Column: "id", Location: 135},
+				IdentErr{Table: "users", Column: "id", Location: 11},
 			)
 		})
 	})
@@ -415,20 +431,25 @@ func checkIdentErr(t *testing.T, i IdentErr, err error) {
 		return
 	}
 
+	outputErr := func(format string, args ...interface{}) {
+		t.Helper()
+		t.Errorf("(%s.%s.%s) "+format, append([]interface{}{i.Schema, i.Table, i.Column}, args...)...)
+	}
+
 	if i.Kind != 0 && i.Kind != e.Kind {
-		t.Errorf("kind wrong, want: %d, got: %d", i.Kind, e.Kind)
+		outputErr("kind wrong, want: %d, got: %d", i.Kind, e.Kind)
 	}
 	if len(i.Schema) != 0 && i.Schema != e.Schema {
-		t.Errorf("schema wrong, want: %s, got: %s", i.Schema, e.Schema)
+		outputErr("schema wrong, want: %s, got: %s", i.Schema, e.Schema)
 	}
 	if len(i.Table) != 0 && i.Table != e.Table {
-		t.Errorf("table wrong, want: %s, got: %s", i.Table, e.Table)
+		outputErr("table wrong, want: %s, got: %s", i.Table, e.Table)
 	}
 	if len(i.Column) != 0 && i.Column != e.Column {
-		t.Errorf("column wrong, want: %s, got: %s", i.Column, e.Column)
+		outputErr("column wrong, want: %s, got: %s", i.Column, e.Column)
 	}
 	if i.Location != 0 && i.Location != e.Location {
-		t.Errorf("location wrong, want: %d, got: %d", i.Location, e.Location)
+		outputErr("location wrong, want: %d, got: %d", i.Location, e.Location)
 	}
 }
 
@@ -441,29 +462,34 @@ func checkTypeErr(t *testing.T, te TypeErr, err error) {
 		return
 	}
 
+	outputErr := func(format string, args ...interface{}) {
+		t.Helper()
+		t.Errorf("(%s.%s.%s) "+format, append([]interface{}{e.Schema, e.Table, e.Column}, args...)...)
+	}
+
 	if len(te.Schema) != 0 && te.Schema != e.Schema {
-		t.Errorf("schema wrong, want: %s, got: %s", te.Schema, e.Schema)
+		outputErr("schema wrong, want: %s, got: %s", te.Schema, e.Schema)
 	}
 	if len(te.Table) != 0 && te.Table != e.Table {
-		t.Errorf("table wrong, want: %s, got: %s", te.Table, e.Table)
+		outputErr("table wrong, want: %s, got: %s", te.Table, e.Table)
 	}
 	if len(te.Column) != 0 && te.Column != e.Column {
-		t.Errorf("column wrong, want: %s, got: %s", te.Column, e.Column)
+		outputErr("column wrong, want: %s, got: %s", te.Column, e.Column)
 	}
 	if len(te.CallType) != 0 && te.CallType != e.CallType {
-		t.Errorf("call type wrong, want: %s, got: %s", te.CallType, e.CallType)
+		outputErr("call type wrong, want: %s, got: %s", te.CallType, e.CallType)
 	}
 	if len(te.DriverType) != 0 && te.DriverType != e.DriverType {
-		t.Errorf("go type wrong, want: %s, got: %s", te.DriverType, e.DriverType)
+		outputErr("go type wrong, want: %s, got: %s", te.DriverType, e.DriverType)
 	}
 	if len(te.DBType) != 0 && te.DBType != e.DBType {
-		t.Errorf("dbtype wrong, want: %s, got: %s", te.DBType, e.DBType)
+		outputErr("dbtype wrong, want: %s, got: %s", te.DBType, e.DBType)
 	}
 	if te.Parameter != 0 && te.Parameter != e.Parameter {
-		t.Errorf("parameter wrong, want: %d, got: %d", te.Parameter, e.Parameter)
+		outputErr("parameter wrong, want: %d, got: %d", te.Parameter, e.Parameter)
 	}
 	if te.Location != 0 && te.Location != e.Location {
-		t.Errorf("location wrong, want: %d, got: %d", te.Location, e.Location)
+		outputErr("location wrong, want: %d, got: %d", te.Location, e.Location)
 	}
 }
 

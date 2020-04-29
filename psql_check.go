@@ -255,7 +255,7 @@ func checkCallRecurse(state *State, fn Call, scope *Scope, n pgnodes.Node) (errs
 	return errs
 }
 
-func checkSelect(state *State, fn Call, scope *Scope, sel pgnodes.SelectStmt) (selectMap interface{}, errs []error) {
+func checkSelect(state *State, fn Call, scope *Scope, sel pgnodes.SelectStmt) (outputCallRefs []outputColRef, errs []error) {
 	descend := func(node pgnodes.Node) []error {
 		return append(errs, checkCallRecurse(state, fn, scope, node)...)
 	}
@@ -339,7 +339,9 @@ func checkSelect(state *State, fn Call, scope *Scope, sel pgnodes.SelectStmt) (s
 				errs = append(errs, subSelectErrs...)
 			}
 
-			_ = subSelMap
+			pseudoTable := outputColsToPseudoTable(*item.Alias.Aliasname, subSelMap)
+			scope.pushPseudoTable(*item.Alias.Aliasname, pseudoTable)
+			nTables++
 		default:
 			panic(fmt.Sprintf("what is this weird from statement: %T", item))
 		}
@@ -360,10 +362,9 @@ func checkSelect(state *State, fn Call, scope *Scope, sel pgnodes.SelectStmt) (s
 	for _, listItem := range sel.TargetList.Items {
 		resTarg := listItem.(pgnodes.ResTarget)
 
-		// If there's no name we need to do no fancy scoping pieces
-		if resTarg.Name == nil {
-			errs = descend(resTarg.Val)
-			continue
+		var name string
+		if resTarg.Name != nil {
+			name = *resTarg.Name
 		}
 
 		var column *drivers.Column
@@ -371,6 +372,13 @@ func checkSelect(state *State, fn Call, scope *Scope, sel pgnodes.SelectStmt) (s
 		if ok {
 			var schema, table, col string
 			ln := len(colRef.Fields.Items)
+
+			if ln == 1 {
+				if _, ok := colRef.Fields.Items[0].(pgnodes.A_Star); ok {
+					panic("subqueries with * are not supported yet")
+				}
+			}
+
 			col = colRef.Fields.Items[ln-1].(pgnodes.String).Str
 			if ln >= 2 {
 				table = colRef.Fields.Items[ln-2].(pgnodes.String).Str
@@ -389,11 +397,16 @@ func checkSelect(state *State, fn Call, scope *Scope, sel pgnodes.SelectStmt) (s
 					Location: colRef.Location,
 					Fn:       fn,
 				})
+				continue
+			}
+
+			if len(name) == 0 {
+				name = column.Name
 			}
 		}
 
 		addRefs = append(addRefs, outputColRef{
-			name: *resTarg.Name, col: column,
+			name: name, col: column,
 		})
 	}
 
@@ -416,7 +429,7 @@ func checkSelect(state *State, fn Call, scope *Scope, sel pgnodes.SelectStmt) (s
 		scope.popTable()
 	}
 
-	return nil, errs
+	return addRefs, errs
 }
 
 func checkUpdate(state *State, fn Call, scope *Scope, update pgnodes.UpdateStmt) (errs []error) {
@@ -655,6 +668,22 @@ type outputColRef struct {
 	col  *drivers.Column
 }
 
+func outputColsToPseudoTable(name string, refs []outputColRef) *drivers.Table {
+	table := &drivers.Table{Name: name}
+
+	for _, r := range refs {
+		var col drivers.Column
+		if r.col != nil {
+			col = *r.col
+		}
+		col.Name = r.name
+
+		table.Columns = append(table.Columns, col)
+	}
+
+	return table
+}
+
 // NewScope creates a new object for keeping track of tables in scope
 func NewScope(info *drivers.DBInfo) *Scope {
 	return &Scope{
@@ -699,8 +728,8 @@ func (s *Scope) pushTable(schema, table, alias string) bool {
 
 // pushPseudoTable is used for when we need to create a new table
 // out of thin air. Useful for subqueries etc.
-func (s *Scope) pushPseudoTable(schema, table, alias string, data *drivers.Table) {
-	debugf("PUSH(P): s(%s) t(%s) a(%s)\n", schema, table, alias)
+func (s *Scope) pushPseudoTable(alias string, data *drivers.Table) {
+	debugf("PUSH(P): a(%s)\n", alias)
 	s.aliases = append(s.aliases, alias)
 	s.tables = append(s.tables, data)
 }
